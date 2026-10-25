@@ -1,0 +1,12 @@
+# In-cluster agent (octo-sts, 1-hour tokens). It can push branches and open
+# PRs; main is protected, so prod only changes when nashant merges.
+issuer: https://23oak-k8s-oidc.s3.eu-west-2.amazonaws.com
+subject: system:serviceaccount:opencode:opencode
+audience: octo-sts.octo-sts.svc
+permissions:
+  actions: read
+  checks: read
+  contents: write
+  issues: write
+  pull_requests: write
+  statuses: read

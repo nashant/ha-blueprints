@@ -1,0 +1,341 @@
+blueprint:
+  name: Alarmo zone alarm
+  description: >
+    Alarm mode controller (v3 = v2 + refused-arm recovery + delay-state entry fix):
+    - desired_mode derived from zone people count + schedule
+    - on entry (zone increases from 0) while the alarm is live - armed_*, arming,
+      pending or triggered, schedule irrelevant: disarm -> wait for door cycle
+      -> require ALL entry doors closed and untouched for quiet_period -> re-arm to the
+      mode desired NOW (recomputed after the waits, not frozen at run start).
+      Covers the 2026-08-24 false alarm: door opened (pending) before the zone
+      trigger's 30s hold fired; old handover required armed_* and the reconcile
+      mistook pending for disarmed, so nothing disarmed and the siren fired
+    - never blind-arms with skip_delay while an entry door is open; an open door falls
+      back to a normal (delayed) arm so Alarmo can refuse loudly instead of instant-triggering
+    - v3: when an arm is REFUSED (open sensors), Alarmo's arm_failure notification fires
+      once, then this blueprint waits for the reported blockers AND all entry doors to be
+      closed + a settle period, re-checks the desired mode (aborts if someone came home),
+      and re-arms with exit delay. Bounded by retry_window; on give-up one final arm
+      attempt re-fires the arm_failure notification.
+    - startup reconcile arms without skip_delay so a sensor active at boot cannot
+      instant-trigger
+  domain: automation
+
+  input:
+    zone_entity:
+      name: Zone entity
+      selector:
+        entity:
+          domain: [zone, sensor]
+
+    alarm_entity:
+      name: Alarm entity
+      selector:
+        entity:
+          domain: alarm_control_panel
+
+    code:
+      name: Optional disarm code
+      description: Leave blank if disarm does not require a code.
+      default: ""
+      selector:
+        text: {}
+
+    home_schedule:
+      name: Home-mode schedule
+      description: schedule helper (or input_boolean stand-in for testing)
+      selector:
+        entity:
+          domain: [schedule, input_boolean]
+
+    mode_when_empty:
+      name: Mode when empty
+      default: away
+      selector:
+        text: {}
+
+    mode_when_occupied:
+      name: Mode when occupied (scheduled)
+      default: home
+      selector:
+        text: {}
+
+    entry_doors:
+      name: Entry door sensors (optional)
+      default: []
+      selector:
+        entity:
+          domain: binary_sensor
+          multiple: true
+
+    entry_timeout:
+      name: Entry confirmation timeout
+      description: Max time to wait for each phase of the door cycle.
+      default: "00:10:00"
+      selector:
+        duration: {}
+
+    quiet_period:
+      name: Post-entry quiet period
+      description: >
+        After entry, ALL entry doors must be closed and stay untouched for this long
+        before the alarm re-arms. Any door opening restarts the wait.
+      default: "00:02:00"
+      selector:
+        duration: {}
+
+    auto_arm_entity:
+      name: Auto-arm toggle (optional)
+      description: When set and 'off', the alarm is not armed when the zone becomes empty.
+      default: ""
+      selector:
+        entity:
+          domain: input_boolean
+
+    retry_window:
+      name: Refused-arm retry window
+      description: >
+        After Alarmo refuses to arm (open sensors), keep waiting for everything to be
+        closed and retry for up to this long.
+      default: "01:00:00"
+      selector:
+        duration: {}
+
+    retry_settle:
+      name: Refused-arm settle time
+      description: >
+        Blockers and entry doors must stay closed this long before a re-arm attempt
+        (absorbs door churn while someone goes back in to close things).
+      default: "00:00:15"
+      selector:
+        duration: {}
+
+mode: single
+
+trigger:
+- platform: homeassistant
+  event: start
+  id: startup
+- platform: state
+  entity_id: !input zone_entity
+  id: zone
+  for:
+    seconds: 30
+- platform: state
+  entity_id: !input home_schedule
+  id: schedule
+
+condition:
+  - condition: template
+    value_template: >-
+      {{ states(zone_entity) not in ['unknown','unavailable','none','']
+         and states(home_schedule) not in ['unknown','unavailable','none',''] }}
+
+variables:
+  zone_entity: !input zone_entity
+  alarm_entity: !input alarm_entity
+  code: !input code
+  home_schedule: !input home_schedule
+  mode_when_empty: !input mode_when_empty
+  mode_when_occupied: !input mode_when_occupied
+  entry_doors: !input entry_doors
+  entry_timeout: !input entry_timeout
+  quiet_period: !input quiet_period
+  auto_arm_entity: !input auto_arm_entity
+  auto_arm: "{{ auto_arm_entity in ['', none] or is_state(auto_arm_entity, 'on') }}"
+
+  people: "{{ states(zone_entity) | int(0) }}"
+  scheduled: "{{ is_state(home_schedule, 'on') }}"
+  alarm_state: "{{ states(alarm_entity) }}"
+  armed: "{{ alarm_state.startswith('armed_') }}"
+  # exit delay (arming), entry delay (pending) or siren (triggered): the alarm is
+  # live even though the state doesn't start with 'armed_'
+  in_delay: "{{ alarm_state in ['arming', 'pending', 'triggered'] }}"
+  # 'pending' sentinel never equals away/home/disarm, so a reconcile during a
+  # delay state always sees needs_change and acts instead of no-opping
+  current_mode: "{{ alarm_state[6:] if armed else ('pending' if in_delay else 'disarm') }}"
+
+  from_count: "{{ (trigger.from_state.state if trigger.from_state else people) | int(0) }}"
+  to_count: "{{ (trigger.to_state.state if trigger.to_state else people) | int(0) }}"
+  increased: "{{ trigger.id == 'zone' and to_count > from_count }}"
+
+  desired_mode: "{{ mode_when_empty if people == 0 else (mode_when_occupied if scheduled else 'disarm') }}"
+  needs_change: "{{ desired_mode != current_mode }}"
+  # entry while the alarm is live, ANY time of day: the door may already have
+  # started the entry delay (pending/triggered) by the time the zone trigger's
+  # 30s hold fires - that entry must still be handed over, not dropped
+  handover: "{{ increased and from_count == 0 and (armed or in_delay) }}"
+
+  disarm_data: >
+    {% set data = dict(entity_id=alarm_entity) %}
+    {% if code|length > 0 %}
+      {% set data = dict(data, code=code) %}
+    {% endif %}
+    {{ data }}
+  # v2: reconcile arms keep skip_delay EXCEPT on startup (a sensor active at boot
+  # must go through the exit delay, not instant-trigger)
+  arm_data: "{{ dict(disarm_data, mode=desired_mode, skip_delay=(trigger.id != 'startup')) }}"
+
+  service: "{{ 'alarmo.disarm' if desired_mode == 'disarm' else 'alarmo.arm' }}"
+  service_data: "{{ disarm_data if desired_mode == 'disarm' else arm_data }}"
+
+action:
+# Special case: entry handover
+- choose:
+  - conditions:
+    - condition: template
+      value_template: "{{ handover }}"
+    sequence:
+    - alias: Disarm for entry
+      service: alarmo.disarm
+      data: "{{ disarm_data }}"
+    - choose:
+      - conditions:
+        - condition: template
+          value_template: "{{ entry_doors | length > 0 }}"
+        sequence:
+        - alias: Wait for an entry door to open
+          wait_for_trigger:
+            - platform: state
+              entity_id: !input entry_doors
+              to: "on"
+          timeout: !input entry_timeout
+          continue_on_timeout: true
+        # v2: global quiet - loop until ALL doors are closed and none opened for
+        # quiet_period. A per-door "for:" cannot express this (each entity's timer
+        # is independent), hence the loop.
+        - alias: Wait until all entry doors closed and quiet
+          repeat:
+            sequence:
+            - alias: Wait for all doors closed
+              wait_template: "{{ expand(entry_doors) | selectattr('state','eq','on') | list | count == 0 }}"
+              timeout: !input entry_timeout
+              continue_on_timeout: true
+            - alias: Remember whether doors closed in time
+              variables:
+                all_closed_seen: "{{ wait.completed }}"
+            - alias: Watch for any door reopening during quiet period
+              if:
+                - condition: template
+                  value_template: "{{ all_closed_seen }}"
+              then:
+                - wait_for_trigger:
+                    - platform: state
+                      entity_id: !input entry_doors
+                      to: "on"
+                  timeout: !input quiet_period
+                  continue_on_timeout: true
+            # exit when: doors never closed in time (fall through to a non-skip_delay
+            # arm that fails loudly), OR quiet period passed with all doors closed,
+            # OR safety bound
+            until: >-
+              {{ not all_closed_seen
+                 or (wait.trigger is none
+                     and expand(entry_doors) | selectattr('state','eq','on') | list | count == 0)
+                 or repeat.index >= 30 }}
+      default:
+      - delay: !input entry_timeout
+    # v2: recompute desired state NOW - people may have left, schedule may have
+    # flipped while we waited (mode:single drops those triggers mid-run)
+    - alias: Recompute desired state after waits
+      variables:
+        people_now: "{{ states(zone_entity) | int(0) }}"
+        scheduled_now: "{{ is_state(home_schedule, 'on') }}"
+        auto_arm_now: "{{ auto_arm_entity in ['', none] or is_state(auto_arm_entity, 'on') }}"
+        desired_now: "{{ mode_when_empty if people_now == 0 else (mode_when_occupied if scheduled_now else 'disarm') }}"
+        doors_closed_now: "{{ entry_doors | length == 0 or expand(entry_doors) | selectattr('state','eq','on') | list | count == 0 }}"
+    - choose:
+      - conditions:
+        - condition: template
+          value_template: "{{ desired_now != 'disarm' and (people_now > 0 or auto_arm_now) }}"
+        sequence:
+        - alias: Re-arm (skip_delay only when every entry door is closed)
+          service: alarmo.arm
+          data: "{{ dict(disarm_data, mode=desired_now, skip_delay=doors_closed_now) }}"
+
+  # Default: reconcile to desired mode
+  default:
+  # if/then (not bare conditions) so the run always continues into the shared
+  # arm-recovery tail below. Freeze when the zone is empty and auto-arm is off.
+  - if:
+      - condition: template
+        value_template: "{{ (people > 0 or auto_arm) and needs_change }}"
+    then:
+    - service: "{{ service }}"
+      data: "{{ service_data }}"
+
+# Arm-recovery tail: runs after every branch; engages only when an arm was
+# wanted but Alarmo refused it (panel still 'disarmed' = refusal signal).
+- delay: "00:00:02"
+- alias: Recompute desired state for recovery check
+  variables:
+    people_t: "{{ states(zone_entity) | int(0) }}"
+    scheduled_t: "{{ is_state(home_schedule, 'on') }}"
+    auto_arm_t: "{{ auto_arm_entity in ['', none] or is_state(auto_arm_entity, 'on') }}"
+    desired_t: "{{ mode_when_empty if people_t == 0 else (mode_when_occupied if scheduled_t else 'disarm') }}"
+- choose:
+  - conditions:
+    - condition: template
+      value_template: >-
+        {{ states(alarm_entity) == 'disarmed'
+           and desired_t != 'disarm'
+           and (people_t > 0 or auto_arm_t) }}
+    sequence:
+    - alias: Wait for blockers to clear then re-arm (any mode)
+      repeat:
+        sequence:
+        - variables:
+            blockers: "{{ (state_attr(alarm_entity, 'open_sensors') or {}) | list }}"
+        - alias: Wait for reported blockers and all entry doors to be closed
+          wait_template: >-
+            {{ expand(blockers) | selectattr('state', 'in', ['on', 'open', 'unlocked']) | list | count == 0
+               and (entry_doors | length == 0
+                    or expand(entry_doors) | selectattr('state', 'eq', 'on') | list | count == 0) }}
+          timeout: !input retry_window
+          continue_on_timeout: true
+        - variables:
+            cleared: "{{ wait.completed }}"
+        - if:
+            - condition: template
+              value_template: "{{ cleared }}"
+          then:
+          - alias: Settle so door churn during the fix-up trip doesn't spam retries
+            delay: !input retry_settle
+        - alias: Re-check desired mode and closure after the settle
+          variables:
+            people_r: "{{ states(zone_entity) | int(0) }}"
+            desired_r: "{{ mode_when_empty if people_r == 0 else (mode_when_occupied if is_state(home_schedule, 'on') else 'disarm') }}"
+            wanted_r: >-
+              {{ desired_r != 'disarm'
+                 and (people_r > 0 or auto_arm_entity in ['', none] or is_state(auto_arm_entity, 'on')) }}
+            still_closed: >-
+              {{ expand(blockers) | selectattr('state', 'in', ['on', 'open', 'unlocked']) | list | count == 0
+                 and (entry_doors | length == 0
+                      or expand(entry_doors) | selectattr('state', 'eq', 'on') | list | count == 0) }}
+        - if:
+            - condition: template
+              value_template: "{{ cleared and wanted_r and still_closed and states(alarm_entity) == 'disarmed' }}"
+          then:
+          - alias: Re-arm with exit delay
+            service: alarmo.arm
+            data: "{{ dict(disarm_data, mode=desired_r, skip_delay=false) }}"
+          - delay: "00:00:05"
+        until: >-
+          {{ states(alarm_entity) != 'disarmed'
+             or not cleared
+             or not wanted_r
+             or repeat.index >= 30 }}
+    - alias: Final attempt on give-up re-fires the arm_failure notification
+      if:
+        - condition: template
+          value_template: "{{ states(alarm_entity) == 'disarmed' }}"
+      then:
+      - variables:
+          people_g: "{{ states(zone_entity) | int(0) }}"
+          desired_g: "{{ mode_when_empty if people_g == 0 else (mode_when_occupied if is_state(home_schedule, 'on') else 'disarm') }}"
+      - if:
+          - condition: template
+            value_template: "{{ desired_g != 'disarm' }}"
+        then:
+        - service: alarmo.arm
+          data: "{{ dict(disarm_data, mode=desired_g, skip_delay=false) }}"
